@@ -12,6 +12,7 @@
 -export([start_link/2,
          cancel/1,
          next_run/1,
+	 get_job/1,
          get_datetime/1,
          get_datetime/2,
          set_datetime/3,
@@ -28,7 +29,7 @@
 -include("internal.hrl").
 
 -record(state, {job,
-                alarm_ref,
+                job_ref,
                 ref_epoch,
                 epoch_at_ref,
                 fast_forward=false,
@@ -40,9 +41,8 @@
 
 -define(MILLISECONDS,      1000).
 -define(WAIT_BEFORE_RUN,   1000).
--define(MAX_TIMEOUT_SEC,   1800).
 -define(MAX_TIMEOUT_MSEC,  1800000).
--define(SEC_IN_A_DAY,      86400).
+-define(MSEC_IN_A_DAY,     86400000).
 
 %% compatibility
 -ifdef(OTP_RELEASE). %% this implies 21 or higher
@@ -115,11 +115,15 @@ recalculate(Pid) ->
 next_run(Pid) ->
     gen_server:call(Pid, next_run).
 
+%% Get job spec
+get_job(Pid) ->
+    gen_server:call(Pid, get_job).
+
 %% @doc
 %%  Validate that a run_when spec specified is correct.
 -spec validate(erlcron:run_when()) -> ok | {error, term()}.
 validate(Spec) ->
-    State = #state{job=undefined, alarm_ref=undefined},
+    State = #state{job=undefined, job_ref=undefined},
     {DateTime, ActualMsec} = ecrn_control:ref_datetime(universal),
     NewState = set_internal_time(State, DateTime, ActualMsec),
     try
@@ -138,7 +142,7 @@ validate(Spec) ->
 %% @private
 init([JobRef, {When, Task}, Sched, DateTime, ActualMsec]) ->
     try
-        State = set_internal_time(#state{alarm_ref=JobRef, job={Sched, Task},
+        State = set_internal_time(#state{job_ref=JobRef, job={Sched, Task},
                                          last_run=0, next_run=0, orig_when=When},
                                   DateTime, ActualMsec),
         case until_next_milliseconds(State) of
@@ -159,6 +163,8 @@ init([JobRef, {When, Task}, Sched, DateTime, ActualMsec]) ->
 %% @private
 handle_call(next_run, _From, #state{next_run=Time} = State) ->
     reply_and_wait(Time, State);
+handle_call(get_job, _From, #state{job=Job} = State) ->
+    reply_and_wait(Job, State);
 handle_call(get_datetime, _From, State) ->
     Epoch = ecrn_util:epoch_milliseconds(),
     Msec  = current_epoch(Epoch, State),
@@ -176,7 +182,7 @@ handle_call({set_datetime, DateTime, CurrEpochMsec}, _From, State) ->
         end
     catch ?EXCEPTION(_, E, ST) ->
         ?LOG_ERROR([{error, "Error setting timeout for job"},
-                    {job_ref, State#state.alarm_ref},
+                    {job_ref, State#state.job_ref},
                     {run_when, element(1, State#state.orig_when)},
                     {reason, E},
                     {stack,  ?GET_STACK(ST)}]),
@@ -232,7 +238,7 @@ process_timeout(#state{last_time=LastTime, next_run=NextRun, last_run=LastRun}=S
         end,
     reply_and_wait(Reply, State).
 
-do_job_run(#state{alarm_ref=Ref, next_run=Time, job={When, Job}} = S) ->
+do_job_run(#state{job_ref=Ref, next_run=Time, job={When, Job}} = S) ->
     execute(Job, Ref, Time),
     case When of
         {once, _} ->
@@ -284,7 +290,8 @@ until_next_milliseconds(#state{} = S) ->
     end.
 
 -spec update_next_run(#state{}, erlcron:seconds()) -> {#state{}, erlcron:milliseconds()}.
-update_next_run(#state{} = State, ?SEC_IN_A_DAY) ->
+update_next_run(#state{} = State, Milliseconds) 
+  when Milliseconds >= ?MSEC_IN_A_DAY ->
     {State, ?MAX_TIMEOUT_MSEC};
 update_next_run(#state{last_time=Now} = State, Milliseconds) ->
     Timeout = round_timeout(Milliseconds),
@@ -489,14 +496,14 @@ until_days_from_now(State, Period, Days) ->
 %% @doc Calculates the first time in a given period.
 -spec first_time(normalized_period()) -> erlcron:milliseconds().
 first_time([]) ->
-    ?SEC_IN_A_DAY;
+    ?MSEC_IN_A_DAY;
 first_time([{FromTime, _ToTime, _RepeatSec}|_]) ->
     FromTime.
 
 %% @doc Calculates the last time in a given period.
 -spec last_time(normalized_period()) -> erlcron:milliseconds().
 last_time([]) ->
-    ?SEC_IN_A_DAY;
+    ?MSEC_IN_A_DAY;
 last_time(Period) when is_list(Period) ->
     F = fun({FromTime, _ToTime, 0}) ->
                 FromTime;
@@ -508,19 +515,19 @@ last_time(Period) when is_list(Period) ->
 %% @doc Calculates the first time in the given period after the given time.
 -spec next_time(normalized_period(), erlcron:milliseconds()) -> erlcron:milliseconds().
 next_time([], _Time) ->
-    ?SEC_IN_A_DAY;
+    ?MSEC_IN_A_DAY;
 next_time(Period, Time) when is_list(Period), is_integer(Time) ->
     F = fun({FromTime, _ToTime, _RepeatSec}) when Time =< FromTime ->
               FromTime;
            ({_FromTime, _ToTime, 0}) ->
-              ?SEC_IN_A_DAY;
+		?MSEC_IN_A_DAY;
            ({FromTime, _ToTime, RepeatSec}) ->
               A1 = ((Time-FromTime) div RepeatSec) * RepeatSec,
               A  = if A1 < Time -> A1 + RepeatSec; true -> A1 end,
               FromTime + A
         end,
     case [F(R) || R = {_, ToTm, _} <- Period, Time =< ToTm] of
-        [] -> ?SEC_IN_A_DAY;
+        [] -> ?MSEC_IN_A_DAY;
         LL -> lists:min(LL)
     end.
 
@@ -650,7 +657,7 @@ fast_forward(#state{ref_epoch=OldRefEpoch, next_run=NextRun}=S, NewRefEpoch, New
                 Msec =< 0 andalso
                     ?LOG_WARNING([{info, "One-time job executed immediately due to negative time shift"},
                                 {time_shift_secs, to_seconds(Msec)},
-                                {job_ref,  State2#state.alarm_ref},
+                                {job_ref,  State2#state.job_ref},
                                 {job_when, State2#state.orig_when}]),
                 false;
             _ ->

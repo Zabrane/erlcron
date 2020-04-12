@@ -18,6 +18,8 @@
          set_datetime/1,
          reset_datetime/0,
          get_all_jobs/0,
+	 i/0,
+	 list_all_jobs/0,
          multi_set_datetime/1,
          multi_set_datetime/2]).
 
@@ -182,6 +184,21 @@ reset_datetime() ->
 -spec get_all_jobs() -> [job_ref()].
 get_all_jobs() ->
     ecrn_reg:get_all_refs().
+
+i() ->
+    list_all_jobs().
+
+list_all_jobs() ->
+    lists:foreach(
+      fun(Ref) ->
+	      list_job(Ref)
+      end, get_all_jobs()).
+
+list_job(Ref) ->
+    Pid = ecrn_reg:get(Ref),
+    Job = ecrn_agent:get_job(Pid),
+    WhenMs = ecrn_agent:next_run(Pid),
+    io:format("~s: ~p\n", [ecrn_util:epoch_to_datetime_string(WhenMs), Job]).
 
 %% @doc
 %% Set the current date time of the erlcron system running on different nodes.
